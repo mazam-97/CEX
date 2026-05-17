@@ -39,11 +39,11 @@ interface CreateOrderSchema{
 //     price: type === "market" ? null : price,
 //     qty,
 
-const brokerClient = createClient({ url: env.redisUrl }).on("error", (error) => {
+const brokerClient = createClient({ url: env.redisUrl }).on("error", (error: any) => {
   console.error("Redis broker client error", error);
 });
 
-const responseClient = createClient({ url: env.redisUrl }).on("error", (error) => {
+const responseClient = createClient({ url: env.redisUrl }).on("error", (error: any) => {
   console.error("Redis response client error", error);
 });
 
@@ -77,27 +77,8 @@ async function sendResponse(responseQueue: string, response: EngineResponse): Pr
 }
 
 export function handleEngineRequest(message: EngineRequest): unknown {
-  /**
-   * TODO(student):
-   * 1. Check _message.type.
-   * 2. Read _message.payload.
-   * 3. Call your order book / balance / order logic.
-   * 4. Return the data that should go back to the backend.
-   *
-   * Required message types:
-   * - create_order
-   * - get_depth
-   * - get_user_balance
-   * - get_order
-   * - cancel_order
-   */
-   
- 
-  // just checking the flow, remove this when you start implementing the logic
   switch (message.type) {
-
    case "create_order" : {
-  
    const payload = message.payload as unknown as CreateOrderSchema;
    const usersBalance = BALANCES.get(payload.userId as string)??{QUOTE:{available:0,locked:0},"SOL":{available: 0, locked:0}};
    const orderBook = ORDERBOOKS.get(payload.symbol as string);
@@ -108,7 +89,7 @@ export function handleEngineRequest(message: EngineRequest): unknown {
 
    let remainingQty = payload.qty;
    let filledQty = 0;
-
+   let insufficientBalance = false;
      const order: OrderRecord= {
        userId: payload.userId,
        orderId: crypto.randomUUID(),
@@ -128,7 +109,7 @@ export function handleEngineRequest(message: EngineRequest): unknown {
 
                if (payload.side == "buy") {
                  if (orderBook?.asks.size == 0) {
-                   throw new Error("No asks available");
+                   break;
                  }
 
                 //  if (orderBook?.askHeap.heap.length == 0) {
@@ -145,20 +126,23 @@ export function handleEngineRequest(message: EngineRequest): unknown {
                 //    break;
 
                 //  }
+                if (askOrders.length === 0) {
+                  orderBook.askHeap.pop();
+                  continue;
+               }
                  for (const ask of askOrders) {
 
                    if (remainingQty == 0) break;
 
-                   const fillQty = Math.min(ask.qty, remainingQty)
-                   const usersBalance = getUsersBalance(payload.userId);
-
-                   const notional = fillQty * ask.price;
+                  // const notional = fillQty * ask.price;
                    const quoteBal = usersBalance[QUOTE] ?? { available: 0, locked: 0 };
                    const baseBal = usersBalance[ask.symbol] ?? { available: 0, locked: 0 };
-
-                   if (quoteBal.available < notional) {
-                     throw new Error("Insufficient Balance");
+                   const affordableQty = quoteBal.available/ ask.price
+                   if (affordableQty <= 0) {
+                     insufficientBalance = true;
+                     break;
                    }
+                   const fillQty = Math.min(ask.qty,remainingQty, affordableQty );
                    const fill: Fill = {
                      fillId: crypto.randomUUID(),
                      buyOrderId: order.orderId,
@@ -175,7 +159,7 @@ export function handleEngineRequest(message: EngineRequest): unknown {
                  
                    usersBalance[QUOTE] = {
                      ...quoteBal,
-                     available: quoteBal.available as number - notional,
+                     available: quoteBal.available as number - (fillQty * ask.price),
                    };
                    usersBalance[fill.symbol] = {
                      ...baseBal,
@@ -185,7 +169,7 @@ export function handleEngineRequest(message: EngineRequest): unknown {
 
                    const matchedUserBalance = getUsersBalance(ask.userId);
                    matchedUserBalance[QUOTE] = {
-                     available: matchedUserBalance[QUOTE]?.available as number + notional,
+                     available: matchedUserBalance[QUOTE]?.available as number + (fillQty * ask.price),
                      locked: matchedUserBalance[QUOTE]?.locked as number
                    }
 
@@ -208,6 +192,7 @@ export function handleEngineRequest(message: EngineRequest): unknown {
                    }
 
                  }
+                 if(insufficientBalance) break;
                  /// orderbook cleanup
                  askOrders = askOrders.filter(a => a.qty > 0);
                  if (askOrders.length == 0) {
@@ -224,24 +209,29 @@ export function handleEngineRequest(message: EngineRequest): unknown {
 
                  if (orderBook?.bids.size == 0) {
                   break;
-                   throw new Error("No order exists");
                  }
                  const highestBidPrice = - Number(orderBook?.bidHeap.peek());
                  //orderBook?.bidHeap.pop();
                  //if(highestBidPrice == undefined) throw new Error("")
                  let bidOrders = orderBook?.bids.get(highestBidPrice) ?? [];
-                  if (!bidOrders || bidOrders.length === 0) {
-                    break;
-                   //orderBook.bidHeap.pop();
 
-                 }
+                 if (bidOrders.length === 0) {
+                  orderBook.bidHeap.pop();
+                  continue;
+               }
 
                  for (const bid of bidOrders) {
 
                   if(remainingQty== 0) break;
-                   const fillQty = Math.min(bid.qty, remainingQty);
+                   const availableStockBalance = usersBalance[payload.symbol]?.available as number;
+                   const fillQty = Math.min(bid.qty, remainingQty, availableStockBalance);
                   // check users balance
 
+                   if(availableStockBalance <= 0 ){
+                    insufficientBalance = true;
+                    break;
+                   }
+                   
                    const fill: Fill = {
                      fillId: crypto.randomUUID(),
                      buyOrderId: bid.orderId,
@@ -297,6 +287,7 @@ export function handleEngineRequest(message: EngineRequest): unknown {
 
                  }
 
+                 if(insufficientBalance) break;
                  // orderbook clean up
                  bidOrders = bidOrders?.filter(bid => bid.qty > 0);
                  if (bidOrders?.length == 0) {
@@ -315,121 +306,107 @@ export function handleEngineRequest(message: EngineRequest): unknown {
    if (payload.type == "limit") {
      const usersBalance = getUsersBalance(payload.userId);
      const orderBook = ORDERBOOKS.get(payload.symbol);
+     const side = payload.side;
+
      
+      if(side == "buy"){
+
+        if(usersBalance[QUOTE]?.available as number < payload.price * payload.qty){
+          throw new Error ("Insufficient balance");
+        }
+        usersBalance[QUOTE]={
+          available: usersBalance[QUOTE]?.available as number - (payload.price *payload.qty),
+          locked: usersBalance[QUOTE]?.locked as number + (payload.price *payload.qty)
+        }
+      }
+      else{
+        if(usersBalance[payload.symbol]?.available as number < payload.qty){
+          throw new Error("Insufficient quantity");
+        }
+        usersBalance[payload.symbol]={
+          available: usersBalance[payload.symbol]?.available as number - (payload.qty),
+          locked: usersBalance[payload.symbol]?.locked as number + (payload.qty)
+        }
+      }
      while (remainingQty > 0) {
        if (payload.side == "buy") {
-        const requiredBalance =
-        (payload.price as number) * remainingQty;
-     if (usersBalance[QUOTE]?.available as number < requiredBalance){
-      throw new Error("Insufficient Balance");
-     }
-           //throw new Error("Insufficient balance");
-           const lowestPrice = orderBook?.askHeap.peek() as number;
-           if (lowestPrice <= (payload.price as unknown as number)) {
-             let askOrders = orderBook?.asks.get(lowestPrice);
-             for (let ask of askOrders!) {
-              if(remainingQty ==0) break;
-               const fillQty = Math.min(ask.qty, remainingQty);
-               filledQty += fillQty;
-               remainingQty -= fillQty;
-               const fill: Fill = {
-                 fillId: crypto.randomUUID(),
-                 buyOrderId: order.orderId,
-                 sellOrderId: ask.orderId,
-                 price: ask.price,
-                 qty: fillQty,
-                 symbol: payload.symbol,
-                 createdAt: Date.now()
-               }
+        
+         //throw new Error("Insufficient balance");
+         const lowestPrice = orderBook?.askHeap.peek() as number;
+         if(lowestPrice == null || lowestPrice == undefined || lowestPrice > payload.price) break;
 
-               order.fills.push(fill);
-               usersBalance[payload.symbol] = {
-                 available: usersBalance[payload.symbol]?.available as number + fillQty,
-                 locked: usersBalance[payload.symbol]?.locked ?? 0 as number
-               }
-               usersBalance[QUOTE] = {
-                 available: usersBalance[QUOTE]?.available as number - (ask.price as unknown as number * fillQty),
-                 locked: usersBalance[QUOTE]?.locked ?? 0 as number
-               }
-  
-               const makerBalance = getUsersBalance(ask.userId);
-               makerBalance[QUOTE] = {
-                 available: makerBalance[QUOTE]?.available as number + (ask.price * fillQty),
-                 locked: makerBalance[QUOTE]?.locked as number 
-               }
-  
-               makerBalance[payload.symbol] = {
-                 available: makerBalance[payload.symbol]?.available as number,
-                 locked: makerBalance[payload.symbol]?.locked as number -fillQty
-               }
-  
-               BALANCES.set(payload.userId, { ...usersBalance });
-               BALANCES.set(ask.userId, { ...makerBalance });
-  
-               ask.filledQty += fillQty;
-               ask.qty -= fillQty;
-              
-               if (ask.qty === 0) {
-                 ask.status = "filled"
-               }
-               else {
-                 ask.status = "partially_filled"
-               }
-  
+           let askOrders = orderBook?.asks.get(lowestPrice);
+           for (let ask of askOrders!) {
+             if (remainingQty == 0) break;
+             const fillQty = Math.min(ask.qty, remainingQty);
+             filledQty += fillQty;
+             remainingQty -= fillQty;
+             const fill: Fill = {
+               fillId: crypto.randomUUID(),
+               buyOrderId: order.orderId,
+               sellOrderId: ask.orderId,
+               price: ask.price,
+               qty: fillQty,
+               symbol: payload.symbol,
+               createdAt: Date.now()
              }
-             askOrders = askOrders?.filter(a => a.qty >0)?? [];
-             if(askOrders?.length ==0){
-               orderBook?.asks.delete(lowestPrice);
-               orderBook?.askHeap.pop();
-               
+
+             order.fills.push(fill);
+             usersBalance[payload.symbol] = {
+               available: usersBalance[payload.symbol]?.available as number + fillQty,
+               locked: usersBalance[payload.symbol]?.locked ?? 0 as number
              }
-             else{
-              orderBook?.asks.set(lowestPrice,askOrders)
+             usersBalance[QUOTE] = {
+               available: usersBalance[QUOTE]?.available as number + ((payload.price * fillQty) - (ask.price * fillQty)),
+               locked: usersBalance[QUOTE]?.locked ?? 0 as number - (payload.price * fillQty)
              }
+
+             const makerBalance = getUsersBalance(ask.userId);
+             makerBalance[QUOTE] = {
+               available: makerBalance[QUOTE]?.available as number + (ask.price * fillQty),
+               locked: makerBalance[QUOTE]?.locked as number
+             }
+
+             makerBalance[payload.symbol] = {
+               available: makerBalance[payload.symbol]?.available as number,
+               locked: makerBalance[payload.symbol]?.locked as number - fillQty
+             }
+
+             BALANCES.set(payload.userId, { ...usersBalance });
+             BALANCES.set(ask.userId, { ...makerBalance });
+
+             ask.filledQty += fillQty;
+             ask.qty -= fillQty;
+
+             if (ask.qty === 0) {
+               ask.status = "filled"
+             }
+             else {
+               ask.status = "partially_filled"
+             }
+
+           }
+           askOrders = askOrders?.filter(a => a.qty > 0) ?? [];
+           if (askOrders?.length == 0) {
+             orderBook?.asks.delete(lowestPrice);
+             orderBook?.askHeap.pop();
+
+           }
+           else {
+             orderBook?.asks.set(lowestPrice, askOrders)
            }
          
-          if(remainingQty>0){
-          
-            const restingOrder: RestingOrder = {
-              orderId: order.orderId,
-              userId: payload.userId,
-              filledQty: 0,
-              status: "open",
-              price: payload.price as unknown as number,
-              qty: remainingQty,
-              side: "buy",
-              symbol: payload.symbol,
-              type: payload.type,
-              createdAt: Date.now()
-            }
- 
-            const restingOrdersAtlimitPrice = orderBook?.bids.get(payload.price as unknown as number)??[];
-            if (restingOrdersAtlimitPrice) {
-              restingOrdersAtlimitPrice.push(restingOrder)
-            }
-            if(!orderBook?.bids.has(payload.price)){
-              orderBook?.bidHeap.push(- payload.price);
-            }
-            orderBook?.bids.set(payload.price as unknown as number, restingOrdersAtlimitPrice);
-           
-            usersBalance[QUOTE] = {
-              available: usersBalance[QUOTE]?.available as number - (remainingQty * (payload.price as unknown as number)) as number,
-              locked: usersBalance[QUOTE]?.locked as number+(remainingQty * (payload.price as unknown as number)) as number
-            }
-            BALANCES.set(payload.userId, { ...usersBalance })
-            
-            
-          }
-          break;
+
+        
+
        }
 
        if (payload.side == "sell") {
-         if (usersBalance[payload.symbol]?.available as number < payload.qty) {
-          throw new Error("Insufficient balance");
-         }
+        
          let maxBidPrice = orderBook?.bidHeap.peek();
+
+         if(maxBidPrice == null || maxBidPrice == undefined || (-maxBidPrice) < payload.price) break;
          maxBidPrice = maxBidPrice != null ? -maxBidPrice : maxBidPrice;
-         if ((maxBidPrice as any >= (payload.price as any))) {
            let bidOrders = orderBook?.bids.get(maxBidPrice as unknown as number);
 
            for (const bid of bidOrders!) {
@@ -442,7 +419,7 @@ export function handleEngineRequest(message: EngineRequest): unknown {
                fillId: crypto.randomUUID(),
                buyOrderId: bid.orderId,
                sellOrderId: order.orderId,
-               price: payload.price as unknown as number,
+               price: bid.price as unknown as number,
                qty: currentFillQty,
                createdAt: Date.now(),
                symbol: bid.symbol
@@ -460,8 +437,8 @@ export function handleEngineRequest(message: EngineRequest): unknown {
              }
 
              usersBalance[payload.symbol] = {
-               available: usersBalance[payload.symbol]?.available as number - currentFillQty,
-               locked: usersBalance[payload.symbol]?.locked as number
+               available: usersBalance[payload.symbol]?.available as number ,
+               locked: usersBalance[payload.symbol]?.locked as number - currentFillQty
              }
 
              usersBalance[QUOTE] = {
@@ -483,60 +460,87 @@ export function handleEngineRequest(message: EngineRequest): unknown {
              BALANCES.set(bid.userId, { ...makersBalance });
 
            }
-           bidOrders = bidOrders?.filter(a => a.qty > 0)??[]
-           if(bidOrders?.length ==0){
+           bidOrders = bidOrders?.filter(a => a.qty > 0) ?? []
+           if (bidOrders?.length == 0) {
              orderBook?.bids.delete(maxBidPrice as number)
              orderBook?.bidHeap.pop();
            }
-           else{
-            orderBook?.bids.set(maxBidPrice as number, bidOrders )
+           else {
+             orderBook?.bids.set(maxBidPrice as number, bidOrders)
            }
 
-         }
-         if(remainingQty>0){
-          // if (usersBalance[payload.symbol]?.available as number < payload.qty) {
-          //   throw new Error("Insufficient balance");
-          // }
-           /// sit on orderbook
-           const existingasksOnlimitPrice = orderBook?.asks.get(payload.price as unknown as number);
-           const restingOrder: RestingOrder = {
-             orderId: order.orderId,
-             price: payload.price as unknown as number,
-             qty: remainingQty,
-             side: "sell",
-             status: "open",
-             symbol: payload.symbol,
-             type: payload.type,
-             userId: payload.userId,
-             createdAt: Date.now(),
-             filledQty: filledQty
-           }
-  
-  
-           if (existingasksOnlimitPrice) {
-        
-              existingasksOnlimitPrice.push(restingOrder);
-            
-             orderBook?.asks.set(payload.price as unknown as number, existingasksOnlimitPrice);
-          
-           }
-           else {
-            
-             orderBook?.asks.set(payload.price as unknown as number, [restingOrder]);
-           }
-           usersBalance[payload.symbol] = {
-             available: usersBalance[payload.symbol]?.available as number - remainingQty,
-             locked: usersBalance[payload.symbol]?.locked as number + remainingQty
-           }
-  
-           BALANCES.set(payload.userId, { ...usersBalance });
-           break;
-  
-         }
+         
+      
 
        }
 
      }
+     if (remainingQty > 0 && payload.side == "buy") {
+
+      const restingOrder: RestingOrder = {
+        orderId: order.orderId,
+        userId: payload.userId,
+        filledQty: filledQty,
+        status: filledQty == 0
+          ? "open"
+          : "partially_filled",
+        price: payload.price as unknown as number,
+        qty: remainingQty,
+        side: "buy",
+        symbol: payload.symbol,
+        type: payload.type,
+        createdAt: Date.now()
+      }
+
+      const restingOrdersAtlimitPrice = orderBook?.bids.get(payload.price as unknown as number) ?? [];
+      if (restingOrdersAtlimitPrice) {
+        restingOrdersAtlimitPrice.push(restingOrder)
+      }
+      if (!orderBook?.bids.has(payload.price)) {
+        orderBook?.bidHeap.push(- payload.price);
+      }
+      orderBook?.bids.set(payload.price as unknown as number, restingOrdersAtlimitPrice);
+
+      BALANCES.set(payload.userId, { ...usersBalance })
+
+
+    }
+
+    if (remainingQty > 0 && payload.side == "sell")  {
+      // if (usersBalance[payload.symbol]?.available as number < payload.qty) {
+      //   throw new Error("Insufficient balance");
+      // }
+      /// sit on orderbook
+      const existingasksOnlimitPrice = orderBook?.asks.get(payload.price as unknown as number);
+      const restingOrder: RestingOrder = {
+        orderId: order.orderId,
+        price: payload.price as unknown as number,
+        qty: remainingQty,
+        side: "sell",
+        status: filledQty == 0 ? "open": "partially_filled",
+        symbol: payload.symbol,
+        type: payload.type,
+        userId: payload.userId,
+        createdAt: Date.now(),
+        filledQty: filledQty
+      }
+
+
+      if (existingasksOnlimitPrice) {
+
+        existingasksOnlimitPrice.push(restingOrder);
+
+        orderBook?.asks.set(payload.price as unknown as number, existingasksOnlimitPrice);
+
+      }
+      else {
+        orderBook?.askHeap.push(payload.price)
+        orderBook?.asks.set(payload.price as unknown as number, [restingOrder]);
+      }
+
+      BALANCES.set(payload.userId, { ...usersBalance });
+
+    }
    }
          
    if(payload.type === "market"){
@@ -557,6 +561,7 @@ export function handleEngineRequest(message: EngineRequest): unknown {
        order.status = "filled";
     }
  }
+     order.filledQty = filledQty;
      ORDERS.set(order.orderId, order);
    return {
      orderId: order.orderId,
@@ -650,6 +655,7 @@ export function handleEngineRequest(message: EngineRequest): unknown {
       }
     }
   }
+  break;
   case "get_depth": {
 
     const { symbol } = message.payload;
@@ -723,6 +729,7 @@ export function handleEngineRequest(message: EngineRequest): unknown {
   
     return response;
   }
+  }
 }
 
 
@@ -758,5 +765,3 @@ for (;;) {
     });
   }
 }
-}
-
