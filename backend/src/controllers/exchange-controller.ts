@@ -2,6 +2,7 @@ import type { Request, Response } from "express";
 import {
   orderBodySchema,
   orderIdParamSchema,
+  addBalanceSchema,
   symbolParamSchema,
 } from "../types/exchange-schema.js";
 import { sendToEngine } from "../utils/engine-client.js";
@@ -56,11 +57,33 @@ export async function getBalance(req: Request, res: Response): Promise<void> {
   const engineResponse = await sendToEngine("get_user_balance", {
     userId: getUserId(req),
   });
-
   res.status(engineResponse.ok ? 200 : 400).json(engineResponse.ok ? engineResponse.data : {
     error: engineResponse.error,
   });
 }
+
+ export async function addBalance(req:Request, res: Response): Promise<void>{
+
+  const parsedBalance = addBalanceSchema.safeParse(req.body);
+  
+  if(!parsedBalance.success){
+    sendValidationError(res, parsedBalance.error);
+    return;
+  }
+  const key = parsedBalance.data.key;
+  const balance = parsedBalance.data.balance;
+  const engineResponse = await sendToEngine("add_user_balance",{
+    userId: getUserId(req),
+    key,
+    balance
+  })
+  res.status(engineResponse.ok ? 200 : 400).json(engineResponse.ok ? engineResponse.data : {
+    error: engineResponse.error,
+  });
+ } 
+
+
+
 
 export async function getOrder(req: Request, res: Response): Promise<void> {
   const parsedParams = orderIdParamSchema.safeParse(req.params);

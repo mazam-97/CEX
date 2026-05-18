@@ -27,6 +27,7 @@ export function waitForEngineResponse(
 }
 
 export function resolveEngineResponse(response: EngineResponse): void {
+  console.log(`response ${JSON.stringify(response)}`);
   const pending = pendingResponses.get(response.correlationId);
   if (!pending) return;
 

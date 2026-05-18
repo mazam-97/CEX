@@ -8,7 +8,8 @@ export type EngineCommandType =
   | "get_depth"
   | "get_user_balance"
   | "get_order"
-  | "cancel_order";
+  | "cancel_order"
+  | "add_user_balance"
 
 export interface EngineRequest {
   correlationId: string;
@@ -72,6 +73,38 @@ const emptyBalane: Record<string,Balance> ={
 function getUsersBalance(userId: string): Record<string,Balance>{
  return BALANCES?.get(userId)??emptyBalane;
 }
+
+function ensureUserBalances(userId: string, symbol: string): Record<string, Balance> {
+  let row = BALANCES.get(userId);
+  if (!row) {
+    row = {
+      [QUOTE]: { available: 0, locked: 0 },
+      [symbol]: { available: 0, locked: 0 },
+    };
+    BALANCES.set(userId, row);
+  }
+  if (!row[QUOTE]) row[QUOTE] = { available: 0, locked: 0 };
+  if (!row[symbol]) row[symbol] = { available: 0, locked: 0 };
+  return row;
+}
+
+function normalizeSymbol(symbol: string): string {
+  return symbol.trim().replace(/^:+/, "");
+}
+
+function getOrCreateOrderBook(symbol: string): OrderBook {
+  let book = ORDERBOOKS.get(symbol);
+  if (!book) {
+    book = {
+      asks: new Map<number, RestingOrder[]>(),
+      bids: new Map<number, RestingOrder[]>(),
+      askHeap: new Minheap(),
+      bidHeap: new Minheap(),
+    };
+    ORDERBOOKS.set(symbol, book);
+  }
+  return book;
+}
 async function sendResponse(responseQueue: string, response: EngineResponse): Promise<void> {
   await responseClient.lPush(responseQueue, JSON.stringify(response));
 }
@@ -80,12 +113,10 @@ export function handleEngineRequest(message: EngineRequest): unknown {
   switch (message.type) {
    case "create_order" : {
    const payload = message.payload as unknown as CreateOrderSchema;
+   const symbol = normalizeSymbol(payload.symbol);
+   payload.symbol = symbol;
    const usersBalance = BALANCES.get(payload.userId as string)??{QUOTE:{available:0,locked:0},"SOL":{available: 0, locked:0}};
-   const orderBook = ORDERBOOKS.get(payload.symbol as string);
-
-   if(!orderBook){
-     throw new Error("Order book not found");
-   }
+   const orderBook = getOrCreateOrderBook(symbol);
 
    let remainingQty = payload.qty;
    let filledQty = 0;
@@ -213,7 +244,7 @@ export function handleEngineRequest(message: EngineRequest): unknown {
                  const highestBidPrice = - Number(orderBook?.bidHeap.peek());
                  //orderBook?.bidHeap.pop();
                  //if(highestBidPrice == undefined) throw new Error("")
-                 let bidOrders = orderBook?.bids.get(highestBidPrice) ?? [];
+                 let bidOrders = orderBook.bids.get(highestBidPrice) ?? [];
 
                  if (bidOrders.length === 0) {
                   orderBook.bidHeap.pop();
@@ -304,30 +335,37 @@ export function handleEngineRequest(message: EngineRequest): unknown {
      }
 
    if (payload.type == "limit") {
-     const usersBalance = getUsersBalance(payload.userId);
-     const orderBook = ORDERBOOKS.get(payload.symbol);
+     const usersBalance = ensureUserBalances(payload.userId, payload.symbol);
      const side = payload.side;
 
      
       if(side == "buy"){
-
-        if(usersBalance[QUOTE]?.available as number < payload.price * payload.qty){
-          throw new Error ("Insufficient balance");
+        const quoteAvailable = usersBalance[QUOTE]?.available ?? 0;
+        const requiredQuote = payload.price * payload.qty;
+        if (quoteAvailable < requiredQuote) {
+          throw new Error(
+            `Insufficient balance: need ${requiredQuote} ${QUOTE}, have ${quoteAvailable} ${QUOTE}`,
+          );
         }
         usersBalance[QUOTE]={
-          available: usersBalance[QUOTE]?.available as number - (payload.price *payload.qty),
-          locked: usersBalance[QUOTE]?.locked as number + (payload.price *payload.qty)
+          available: quoteAvailable - requiredQuote,
+          locked: (usersBalance[QUOTE]?.locked ?? 0) + requiredQuote,
         }
       }
       else{
-        if(usersBalance[payload.symbol]?.available as number < payload.qty){
-          throw new Error("Insufficient quantity");
+        const baseAvailable = usersBalance[payload.symbol]?.available ?? 0;
+        if (baseAvailable < payload.qty) {
+          throw new Error(
+            `Insufficient quantity: need ${payload.qty} ${payload.symbol}, have ${baseAvailable}`,
+          );
         }
         usersBalance[payload.symbol]={
-          available: usersBalance[payload.symbol]?.available as number - (payload.qty),
-          locked: usersBalance[payload.symbol]?.locked as number + (payload.qty)
+          available: baseAvailable - payload.qty,
+          locked: (usersBalance[payload.symbol]?.locked ?? 0) + payload.qty,
         }
       }
+      BALANCES.set(payload.userId, { ...usersBalance });
+
      while (remainingQty > 0) {
        if (payload.side == "buy") {
         
@@ -395,13 +433,8 @@ export function handleEngineRequest(message: EngineRequest): unknown {
            else {
              orderBook?.asks.set(lowestPrice, askOrders)
            }
-         
 
-        
-
-       }
-
-       if (payload.side == "sell") {
+       } else if (payload.side == "sell") {
         
          let maxBidPrice = orderBook?.bidHeap.peek();
 
@@ -468,13 +501,9 @@ export function handleEngineRequest(message: EngineRequest): unknown {
            else {
              orderBook?.bids.set(maxBidPrice as number, bidOrders)
            }
-
-         
-      
-
        }
-
      }
+
      if (remainingQty > 0 && payload.side == "buy") {
 
       const restingOrder: RestingOrder = {
@@ -484,22 +513,21 @@ export function handleEngineRequest(message: EngineRequest): unknown {
         status: filledQty == 0
           ? "open"
           : "partially_filled",
-        price: payload.price as unknown as number,
+        price: payload.price,
         qty: remainingQty,
         side: "buy",
         symbol: payload.symbol,
-        type: payload.type,
+        type: "limit",
         createdAt: Date.now()
       }
 
-      const restingOrdersAtlimitPrice = orderBook?.bids.get(payload.price as unknown as number) ?? [];
-      if (restingOrdersAtlimitPrice) {
-        restingOrdersAtlimitPrice.push(restingOrder)
+      const restingOrdersAtLimitPrice =
+        orderBook.bids.get(payload.price as unknown as number) ?? [];
+      restingOrdersAtLimitPrice.push(restingOrder);
+      if (!orderBook.bids.has(payload.price as unknown as number)) {
+        orderBook.bidHeap.push(-payload.price);
       }
-      if (!orderBook?.bids.has(payload.price)) {
-        orderBook?.bidHeap.push(- payload.price);
-      }
-      orderBook?.bids.set(payload.price as unknown as number, restingOrdersAtlimitPrice);
+      orderBook.bids.set(payload.price as unknown as number, restingOrdersAtLimitPrice);
 
       BALANCES.set(payload.userId, { ...usersBalance })
 
@@ -514,12 +542,12 @@ export function handleEngineRequest(message: EngineRequest): unknown {
       const existingasksOnlimitPrice = orderBook?.asks.get(payload.price as unknown as number);
       const restingOrder: RestingOrder = {
         orderId: order.orderId,
-        price: payload.price as unknown as number,
+        price: payload.price,
         qty: remainingQty,
         side: "sell",
         status: filledQty == 0 ? "open": "partially_filled",
         symbol: payload.symbol,
-        type: payload.type,
+        type: "limit",
         userId: payload.userId,
         createdAt: Date.now(),
         filledQty: filledQty
@@ -527,15 +555,11 @@ export function handleEngineRequest(message: EngineRequest): unknown {
 
 
       if (existingasksOnlimitPrice) {
-
         existingasksOnlimitPrice.push(restingOrder);
-
-        orderBook?.asks.set(payload.price as unknown as number, existingasksOnlimitPrice);
-
-      }
-      else {
-        orderBook?.askHeap.push(payload.price)
-        orderBook?.asks.set(payload.price as unknown as number, [restingOrder]);
+        orderBook.asks.set(payload.price as unknown as number, existingasksOnlimitPrice);
+      } else {
+        orderBook.askHeap.push(payload.price);
+        orderBook.asks.set(payload.price as unknown as number, [restingOrder]);
       }
 
       BALANCES.set(payload.userId, { ...usersBalance });
@@ -658,7 +682,10 @@ export function handleEngineRequest(message: EngineRequest): unknown {
   break;
   case "get_depth": {
 
-    const { symbol } = message.payload;
+    const symbol = normalizeSymbol(String(message.payload.symbol ?? ""));
+    if (!symbol) {
+      throw new Error("symbol is required");
+    }
   
     type Bid = {
       price: number,
@@ -678,7 +705,7 @@ export function handleEngineRequest(message: EngineRequest): unknown {
     const orderbook = ORDERBOOKS.get(symbol as string);
   
     if (!orderbook) {
-      throw new Error("Orderbook not found");
+      return { bids: [], asks: [] };
     }
   
     const bids: Bid[] = [];
@@ -729,39 +756,62 @@ export function handleEngineRequest(message: EngineRequest): unknown {
   
     return response;
   }
+  
+  case "add_user_balance": {
+    const { userId, key, balance } = message.payload;
+
+    if (typeof userId !== "string" || typeof key !== "string" || key.length === 0) {
+      throw new Error("invalid_add_balance_payload: userId and key are required");
+    }
+    if (typeof balance !== "number" || !Number.isFinite(balance) || balance <= 0) {
+      throw new Error("invalid_add_balance_payload: balance must be a positive number");
+    }
+
+    const usersBalance = BALANCES.get(userId) ?? {
+      [QUOTE]: { available: 0, locked: 0 },
+      BTC: { available: 0, locked: 0 },
+    };
+
+    usersBalance[key] = {
+      available: (usersBalance[key]?.available ?? 0) + balance,
+      locked: usersBalance[key]?.locked ?? 0,
+    };
+    BALANCES.set(userId, { ...usersBalance });
+
+    return usersBalance;
+  }
+  break;
   }
 }
 
 
+  console.log(`Engine listening on Redis queue: ${env.incomingQueue}`);
 
+  for (;;) {
+    const item = await brokerClient.brPop(env.incomingQueue, 0);
+    if (!item) continue;
 
-console.log(`Engine listening on Redis queue: ${env.incomingQueue}`);
+    let message: EngineRequest;
 
-for (;;) {
-  const item = await brokerClient.brPop(env.incomingQueue, 0);
-  if (!item) continue;
+    try {
+      message = JSON.parse(item.element) as EngineRequest;
+    } catch {
+      console.error("Skipping invalid broker message");
+      continue;
+    }
 
-  let message: EngineRequest;
-
-  try {
-    message = JSON.parse(item.element) as EngineRequest;
-  } catch {
-    console.error("Skipping invalid broker message");
-    continue;
+    try {
+      const data = handleEngineRequest(message);
+      await sendResponse(message.responseQueue, {
+        correlationId: message.correlationId,
+        ok: true,
+        data,
+      });
+    } catch (error) {
+      await sendResponse(message.responseQueue, {
+        correlationId: message.correlationId,
+        ok: false,
+        error: error instanceof Error ? error.message : "engine_error",
+      });
+    }
   }
-
-  try {
-    const data = handleEngineRequest(message);
-    await sendResponse(message.responseQueue, {
-      correlationId: message.correlationId,
-      ok: true,
-      data,
-    });
-  } catch (error) {
-    await sendResponse(message.responseQueue, {
-      correlationId: message.correlationId,
-      ok: false,
-      error: error instanceof Error ? error.message : "engine_error",
-    });
-  }
-}

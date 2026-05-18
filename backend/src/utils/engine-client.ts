@@ -31,6 +31,7 @@ export async function sendToEngine(
   payload: Record<string, unknown>,
 ): Promise<EngineResponse> {
   const correlationId = crypto.randomUUID();
+  console.log(`payload ${JSON.stringify(payload)}`)
   const responsePromise = waitForEngineResponse(correlationId, env.engineTimeoutMs);
 
   const message: EngineRequest = {
@@ -40,6 +41,7 @@ export async function sendToEngine(
     payload,
   };
 
+  console.log(`message ${JSON.stringify(message)}`);
   await publisher.lPush(env.incomingQueue, JSON.stringify(message));
   return responsePromise;
 }
